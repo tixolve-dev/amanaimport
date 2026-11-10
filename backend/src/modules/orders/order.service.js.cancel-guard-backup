@@ -1,0 +1,369 @@
+﻿// backend/src/modules/orders/order.service.js
+'use strict';
+
+const { Order } = require('./order.model');
+const { ORDER_STATUS, canTransition } = require('./order.statuses');
+const { transition } = require('./orderStateMachine');
+const { ProductRequest } = require('../requests/productRequest.model');
+const { REQUEST_STATUS } = require('../requests/request.statuses');
+const { ImporterProfile } = require('../importers/importerProfile.model');
+const { User } = require('../users/user.model');
+const { ROLES } = require('../../shared/constants/roles');
+const { generateOrderRef } = require('../../shared/utils/referenceNumber');
+const ApiError = require('../../shared/utils/ApiError');
+const { parsePagination, buildPaginationMeta } = require('../../shared/utils/pagination');
+
+// ---------- Role-aware projections ----------
+
+// Buyer sees: full order, importer business contact (post-accept is fine here)
+const BUYER_PROJECTION = null; // no restriction
+
+// Importer sees: full order, buyer contact (delivery address is already in snapshot)
+const IMPORTER_PROJECTION = null;
+
+/**
+ * Decorate an order with the counterpart's safe contact info, per role.
+ * Does NOT leak full User records.
+ */
+async function decorateForRole(order, viewerRole) {
+  const obj = order.toObject ? order.toObject() : { ...order };
+  delete obj.__v;
+
+  if (viewerRole === ROLES.BUYER) {
+    // Buyer needs importer contact (needed to arrange delivery, disputes)
+    const importerUser = await User.findById(order.importerUser)
+      .select('fullName email phone');
+    obj.counterparty = {
+      role: 'importer',
+      businessName: order.snapshot.importerBusinessName,
+      fullName: importerUser?.fullName || null,
+      email: importerUser?.email || null,
+      phone: importerUser?.phone || null,
+    };
+  } else if (viewerRole === ROLES.IMPORTER) {
+    // Importer needs buyer contact (delivery coordination)
+    const buyer = await User.findById(order.buyer).select('fullName email phone');
+    obj.counterparty = {
+      role: 'buyer',
+      fullName: buyer?.fullName || null,
+      email: buyer?.email || null,
+      phone: buyer?.phone || null,
+    };
+  } else if (viewerRole === ROLES.ADMIN) {
+    const [buyer, importer] = await Promise.all([
+      User.findById(order.buyer).select('fullName email phone'),
+      User.findById(order.importerUser).select('fullName email phone'),
+    ]);
+    obj.buyerInfo = buyer ? { id: buyer._id, fullName: buyer.fullName, email: buyer.email, phone: buyer.phone } : null;
+    obj.importerInfo = importer ? { id: importer._id, fullName: importer.fullName, email: importer.email, phone: importer.phone } : null;
+  }
+  return obj;
+}
+
+// ---------- Create (called from acceptance) ----------
+
+async function createOrderFromAcceptedQuotation({ buyerId, request, quotation, session }) {
+  const snap = quotation.snapshot;
+  if (!snap) throw ApiError.internal('Quotation snapshot missing at acceptance');
+
+  const order = new Order({
+    referenceNumber: generateOrderRef(),
+    buyer: buyerId,
+    importerUser: snap.importerSnapshot.userId,
+    importerProfile: snap.importerSnapshot.importerProfileId,
+    request: request._id,
+    quotation: quotation._id,
+    snapshot: {
+      requestReferenceNumber: snap.requestSnapshot.referenceNumber,
+      quotationReferenceNumber: quotation.referenceNumber,
+      title: snap.requestSnapshot.title,
+      quantity: snap.requestSnapshot.quantity,
+      unitOfMeasurement: snap.requestSnapshot.unitOfMeasurement,
+      deliveryCity: snap.requestSnapshot.deliveryCity,
+      deliveryAddress: snap.requestSnapshot.deliveryAddress || '',
+      productCondition: snap.productCondition,
+      specifications: snap.specifications || '',
+      warrantyOffered: snap.warrantyOffered || '',
+      returnPolicy: snap.returnPolicy || '',
+      estimatedDeliveryDays: snap.estimatedDeliveryDays,
+      isEstimateFinal: Boolean(snap.isEstimateFinal),
+      exclusions: snap.exclusions || '',
+      itemizedCosts: snap.itemizedCosts.map((c) => ({
+        label: c.label, amountETB: c.amountETB, note: c.note || '',
+      })),
+      importerBusinessName: snap.importerSnapshot.businessName,
+    },
+    totalPriceETB: snap.totalPriceETB,
+    platformFeeETB: 0,
+    platformFeePayer: 'buyer',
+    commissionRuleVersion: null,
+    status: ORDER_STATUS.AWAITING_PAYMENT,
+    acceptedAt: snap.acceptedAt,
+    statusHistory: [{
+      from: null,
+      to: ORDER_STATUS.AWAITING_PAYMENT,
+      actor: buyerId,
+      actorRole: 'buyer',
+      note: 'Order created from accepted quotation',
+    }],
+  });
+
+  await order.save({ session });
+  await require('../notifications/notification.service').notify({
+    recipientId: order.importerUser,
+    type: require('../notifications/notification.model').NOTIFICATION_TYPE.ORDER_CREATED,
+    title: 'Your quotation was accepted',
+    body: `Order ${order.referenceNumber} created. Awaiting payment.`,
+    data: { orderId: order._id.toString() },
+    event: { type: 'Order', targetId: order._id },
+  });
+  return order;
+}
+
+// ---------- Read ----------
+
+async function getOrderForUser(userId, orderId, role) {
+  const order = await Order.findById(orderId);
+  if (!order) throw ApiError.notFound('Order not found');
+
+  const isBuyer = order.buyer.toString() === userId.toString();
+  const isImporter = order.importerUser.toString() === userId.toString();
+
+  if (role === ROLES.ADMIN) {
+    return decorateForRole(order, ROLES.ADMIN);
+  }
+  if (role === ROLES.BUYER && isBuyer) {
+    return decorateForRole(order, ROLES.BUYER);
+  }
+  if (role === ROLES.IMPORTER && isImporter) {
+    return decorateForRole(order, ROLES.IMPORTER);
+  }
+  throw ApiError.forbidden('You do not have access to this order');
+}
+
+async function listMyOrders(userId, role, query) {
+  if (![ROLES.BUYER, ROLES.IMPORTER].includes(role)) {
+    throw ApiError.forbidden('Only buyers and importers can list their orders');
+  }
+  const { page, limit, skip } = parsePagination(query);
+  const filter = role === ROLES.BUYER ? { buyer: userId } : { importerUser: userId };
+  if (query.status) filter.status = query.status;
+
+  const [items, total] = await Promise.all([
+    Order.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
+    Order.countDocuments(filter),
+  ]);
+
+  // Decorate each with counterpart contact
+  const decorated = await Promise.all(items.map((o) => decorateForRole(o, role)));
+  return { items: decorated, meta: buildPaginationMeta({ page, limit, total }) };
+}
+
+// ---------- Transition rules ----------
+
+/**
+ * Actions an actor may take. Prevents e.g. a buyer from marking "shipped".
+ * Each action maps to a target state and a required role.
+ */
+const ACTION_RULES = Object.freeze({
+  // Buyer actions
+  buyer_cancel: { to: ORDER_STATUS.CANCELLED, role: ROLES.BUYER, side: 'buyer' },
+  buyer_confirm_receipt: { to: ORDER_STATUS.COMPLETED, role: ROLES.BUYER, side: 'buyer' },
+
+  // Importer actions
+  importer_start_processing: { to: ORDER_STATUS.PROCESSING, role: ROLES.IMPORTER, side: 'importer' },
+  importer_mark_shipped: { to: ORDER_STATUS.SHIPPING, role: ROLES.IMPORTER, side: 'importer' },
+  importer_mark_customs: { to: ORDER_STATUS.CUSTOMS, role: ROLES.IMPORTER, side: 'importer' },
+  importer_mark_in_transit: { to: ORDER_STATUS.IN_TRANSIT, role: ROLES.IMPORTER, side: 'importer' },
+  importer_mark_ready: { to: ORDER_STATUS.READY_FOR_DELIVERY, role: ROLES.IMPORTER, side: 'importer' },
+  importer_mark_delivered: { to: ORDER_STATUS.DELIVERED, role: ROLES.IMPORTER, side: 'importer' },
+  importer_cancel: { to: ORDER_STATUS.CANCELLED, role: ROLES.IMPORTER, side: 'importer' },
+});
+
+/**
+ * Completion guards enforced when transitioning to COMPLETED or DELIVERED.
+ * (prompt Â§13.12: disputed orders cannot be completed through ordinary action)
+ */
+async function assertCompletionGuards(order) {
+  if (order.status === ORDER_STATUS.DISPUTED) {
+    throw ApiError.conflict('Order is in dispute â€” cannot be completed', {
+      code: 'DISPUTE_OPEN',
+    });
+  }
+  // Payment must have been satisfied (or in a state consistent with completion).
+  // In manual payment mode, orders flow AWAITING â†’ PAYMENT_SATISFIED â†’ PROCESSING â†’ ...
+  // Any order that skipped PAYMENT_SATISFIED cannot be DELIVERED/COMPLETED.
+  const paidStates = [
+    ORDER_STATUS.PAYMENT_SATISFIED,
+    ORDER_STATUS.PROCESSING,
+    ORDER_STATUS.SHIPPING,
+    ORDER_STATUS.CUSTOMS,
+    ORDER_STATUS.IN_TRANSIT,
+    ORDER_STATUS.READY_FOR_DELIVERY,
+    ORDER_STATUS.DELIVERED,
+  ];
+  if (!paidStates.includes(order.status)) {
+    throw ApiError.conflict(
+      'Payment condition is not satisfied â€” order cannot progress',
+      { code: 'PAYMENT_NOT_SATISFIED' },
+    );
+  }
+}
+
+/**
+ * Called by payment module (Phase 1.6) when admin verifies a payment record.
+ */
+async function markPaymentSatisfied(orderId, { verifiedBy, note = '', session }) {
+  const order = await Order.findById(orderId).session(session || null);
+  if (!order) throw ApiError.notFound('Order not found');
+  if (order.status !== ORDER_STATUS.AWAITING_PAYMENT) {
+    // Idempotent: already past payment
+    return order;
+  }
+  transition(order, ORDER_STATUS.PAYMENT_SATISFIED, {
+    actorId: verifiedBy, actorRole: ROLES.ADMIN,
+    note: note || 'Payment verified by admin',
+  });
+  await order.save({ session });
+    await require('../notifications/notification.service').notify({
+    recipientId: order.buyer,
+    type: require('../notifications/notification.model').NOTIFICATION_TYPE.PAYMENT_VERIFIED,
+    title: 'Payment verified',
+    body: `Payment for order ${order.referenceNumber} has been verified.`,
+    data: { orderId: order._id.toString() },
+    event: { type: 'Order', targetId: order._id },
+  });
+  return order;
+}
+
+/**
+ * Impersonated transition used by admin (audit-only, still respects state machine).
+ */
+async function adminTransition(adminId, orderId, to, note = '') {
+  const order = await Order.findById(orderId);
+  if (!order) throw ApiError.notFound('Order not found');
+  transition(order, to, {
+    actorId: adminId, actorRole: ROLES.ADMIN, note: note || 'Admin action',
+  });
+  await order.save();
+  await syncOrderSideEffects(order);
+  return order;
+}
+
+async function transitionOrder(userId, role, orderId, action, { note = '' } = {}) {
+  const rule = ACTION_RULES[action];
+  if (!rule) {
+    throw ApiError.badRequest(`Unknown order action: ${action}`, { code: 'UNKNOWN_ACTION' });
+  }
+  if (rule.role !== role) {
+    throw ApiError.forbidden(
+      `Action "${action}" is not allowed for role "${role}"`,
+      { code: 'ROLE_NOT_ALLOWED' },
+    );
+  }
+
+  const order = await Order.findById(orderId);
+  if (!order) throw ApiError.notFound('Order not found');
+
+  // Ownership
+  if (rule.side === 'buyer' && order.buyer.toString() !== userId.toString()) {
+    throw ApiError.forbidden('You do not own this order');
+  }
+  if (rule.side === 'importer' && order.importerUser.toString() !== userId.toString()) {
+    throw ApiError.forbidden('You do not own this order');
+  }
+
+  // Business guards
+  if (rule.to === ORDER_STATUS.COMPLETED || rule.to === ORDER_STATUS.DELIVERED) {
+    await assertCompletionGuards(order);
+  }
+  if (rule.to === ORDER_STATUS.PROCESSING && order.status !== ORDER_STATUS.PAYMENT_SATISFIED) {
+    throw ApiError.conflict(
+      'Cannot start processing before payment condition is satisfied',
+      { code: 'PAYMENT_NOT_SATISFIED' },
+    );
+  }
+
+  // State machine will validate the transition; we surface INVALID_STATE_TRANSITION
+  // exactly as prompt Â§13.11 requires.
+  if (!canTransition(order.status, rule.to)) {
+    throw ApiError.conflict(
+      `Invalid transition: "${order.status}" â†’ "${rule.to}"`,
+      { code: 'INVALID_STATE_TRANSITION', details: { from: order.status, to: rule.to } },
+    );
+  }
+
+  transition(order, rule.to, { actorId: userId, actorRole: role, note });
+  await order.save();
+    // Notify the counterpart
+  const notifyTarget = role === ROLES.BUYER ? order.importerUser : order.buyer;
+  await require('../notifications/notification.service').notify({
+    recipientId: notifyTarget,
+    type: require('../notifications/notification.model').NOTIFICATION_TYPE.ORDER_STATUS_CHANGED,
+    title: `Order ${order.referenceNumber} updated`,
+    body: `New status: ${order.status}`,
+    data: { orderId: order._id.toString(), status: order.status },
+    event: { type: 'Order', targetId: order._id },
+  });
+  await syncOrderSideEffects(order);
+  return order;
+}
+
+/**
+ * Side effects when an order reaches a terminal state.
+ * - COMPLETED: increment importer's completedOrdersCount, mark request fulfilled
+ * - CANCELLED: no importer stat change (order wasn't fulfilled)
+ */
+async function syncOrderSideEffects(order) {
+  if (order.status === ORDER_STATUS.COMPLETED) {
+    await ImporterProfile.updateOne(
+      { _id: order.importerProfile },
+      { $inc: { completedOrdersCount: 1 } },
+    );
+    const request = await ProductRequest.findById(order.request);
+    if (request && request.status === REQUEST_STATUS.OFFER_SELECTED) {
+      request.statusHistory.push({
+        from: request.status, to: REQUEST_STATUS.FULFILLED,
+        actor: null, actorRole: 'system', note: 'Order completed',
+      });
+      request.status = REQUEST_STATUS.FULFILLED;
+      await request.save();
+    }
+  }
+}
+
+// ---------- Admin listing ----------
+
+async function adminListOrders(query) {
+  const { page, limit, skip } = parsePagination(query);
+  const filter = {};
+  if (query.status) filter.status = query.status;
+  if (query.buyerId) filter.buyer = query.buyerId;
+  if (query.importerId) filter.importerUser = query.importerId;
+
+  const [items, total] = await Promise.all([
+    Order.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
+    Order.countDocuments(filter),
+  ]);
+  return { items, meta: buildPaginationMeta({ page, limit, total }) };
+}
+
+async function adminGetOrder(orderId) {
+  const order = await Order.findById(orderId);
+  if (!order) throw ApiError.notFound('Order not found');
+  return decorateForRole(order, ROLES.ADMIN);
+}
+
+module.exports = {
+  createOrderFromAcceptedQuotation,
+  getOrderForUser,
+  listMyOrders,
+  transitionOrder,
+  markPaymentSatisfied,
+  adminTransition,
+  adminListOrders,
+  adminGetOrder,
+  decorateForRole,
+  ACTION_RULES,
+  ORDER_STATUS,
+};

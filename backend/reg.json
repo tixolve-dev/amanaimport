@@ -1,0 +1,29 @@
+{
+    "success":  true,
+    "message":  "Registration successful",
+    "data":  {
+                 "user":  {
+                              "fullName":  "Abebe Bikila",
+                              "email":  "abebe@example.com",
+                              "phone":  "0911223344",
+                              "role":  "buyer",
+                              "status":  "active",
+                              "buyerType":  "individual",
+                              "isEmailVerified":  false,
+                              "isPhoneVerified":  false,
+                              "preferredLanguage":  "en",
+                              "lastLoginAt":  null,
+                              "deletedAt":  null,
+                              "_id":  "6adef92d42d887359c696cc4",
+                              "createdAt":  "2026-10-26T06:54:38.074Z",
+                              "updatedAt":  "2026-10-26T06:54:38.074Z",
+                              "id":  "6adef92d42d887359c696cc4"
+                          },
+                 "tokens":  {
+                                "accessToken":  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI2YWRlZjkyZDQyZDg4NzM1OWM2OTZjYzQiLCJyb2xlIjoiYnV5ZXIiLCJzdGF0dXMiOiJhY3RpdmUiLCJpYXQiOjE3OTI5OTc2NzgsImV4cCI6MTc5Mjk5ODU3OCwiaXNzIjoiZXRoaW8tbWFya2V0cGxhY2UifQ.bT6-Md4lboSuSod8yShpGVeMFl9u_rlHOebxmj5-ki8",
+                                "refreshToken":  "U0lgsW_Ge9Gl7UU080thX1BTNbtimDcegB9_mKbKey9vj4g8Z1XDgPZxV9CdIrJj",
+                                "tokenType":  "Bearer"
+                            }
+             },
+    "statusCode":  201
+}

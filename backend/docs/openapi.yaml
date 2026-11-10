@@ -1,0 +1,363 @@
+openapi: 3.0.3
+info:
+  title: Ethiopian Import-Sourcing Marketplace API
+  version: 1.0.0
+  description: |
+    REST API for buyers, verified importers, and administrators.
+
+    **Conventions**
+    - Base path: `/api/v1`
+    - Auth: `Authorization: Bearer <accessToken>`
+    - All success responses use `{ success, message, data, meta? }`
+    - All error responses use `{ success: false, error: { code, message, details? }, requestId }`
+    - Monetary amounts are in ETB (Ethiopian Birr)
+    - Pagination: `?page=1&limit=20` → `meta.pagination = { page, limit, total, totalPages }`
+
+servers:
+  - url: http://localhost:5000/api/v1
+    description: Local
+  - url: https://api.example.com/api/v1
+    description: Production (placeholder)
+
+tags:
+  - name: Health
+  - name: Auth
+  - name: Categories
+  - name: Requests
+  - name: Quotations
+  - name: Orders
+  - name: Payments
+  - name: Notifications
+  - name: Shipments
+  - name: Messaging
+  - name: Disputes
+  - name: Reviews
+  - name: Uploads
+  - name: Admin
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        success: { type: boolean, example: false }
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: { type: object, nullable: true }
+        requestId: { type: string }
+    Pagination:
+      type: object
+      properties:
+        page: { type: integer }
+        limit: { type: integer }
+        total: { type: integer }
+        totalPages: { type: integer }
+    UserPublic:
+      type: object
+      properties:
+        id: { type: string }
+        fullName: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string }
+        role: { type: string, enum: [buyer, importer, admin] }
+        status: { type: string }
+        preferredLanguage: { type: string, enum: [en, am] }
+    TokenPair:
+      type: object
+      properties:
+        accessToken: { type: string }
+        refreshToken: { type: string }
+        tokenType: { type: string, example: Bearer }
+    RegisterInput:
+      type: object
+      required: [fullName, email, phone, password, role]
+      properties:
+        fullName: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string, example: "0911223344" }
+        password: { type: string, example: "StrongPass123" }
+        role: { type: string, enum: [buyer, importer] }
+        buyerType: { type: string, enum: [individual, business] }
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      security: []
+      responses:
+        '200': { description: OK }
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Register buyer or importer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterInput' }
+      responses:
+        '201': { description: Created }
+        '409': { description: Conflict (USER_EXISTS) }
+        '422': { description: Validation error }
+  /auth/login:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Login with email OR phone
+      responses: { '200': { description: OK } }
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Rotate refresh token
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Logout (revoke refresh)
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user
+
+  /categories:
+    get:
+      tags: [Categories]
+      security: []
+      summary: List active categories
+    post:
+      tags: [Categories]
+      summary: Create category (admin)
+      security: [{ BearerAuth: [] }]
+
+  /requests:
+    post:
+      tags: [Requests]
+      summary: Create draft request (buyer)
+  /requests/me:
+    get:
+      tags: [Requests]
+      summary: List own requests (buyer)
+  /requests/me/{id}/publish:
+    post:
+      tags: [Requests]
+      summary: Publish draft (buyer)
+  /requests/me/{id}/cancel:
+    post:
+      tags: [Requests]
+      summary: Cancel request (buyer)
+  /requests/browse:
+    get:
+      tags: [Requests]
+      summary: Discover open requests (approved importer only)
+
+  /quotations/requests/{requestId}/quotes:
+    post:
+      tags: [Quotations]
+      summary: Submit quotation (approved importer)
+    get:
+      tags: [Quotations]
+      summary: List quotations for request (buyer, contact hidden pre-accept)
+  /quotations/my-quotes:
+    get:
+      tags: [Quotations]
+      summary: List own quotations (importer)
+  /quotations/{id}:
+    patch:
+      tags: [Quotations]
+      summary: Update own quotation (importer)
+  /quotations/{id}/withdraw:
+    post:
+      tags: [Quotations]
+      summary: Withdraw own quotation
+  /quotations/{id}/accept:
+    post:
+      tags: [Quotations]
+      summary: Accept a quotation → creates order atomically (buyer)
+
+  /orders:
+    get:
+      tags: [Orders]
+      summary: List own orders (buyer or importer)
+  /orders/{id}:
+    get:
+      tags: [Orders]
+      summary: Order detail (role-aware counterpart contact)
+  /orders/{id}/transition:
+    post:
+      tags: [Orders]
+      summary: Advance order state (validated by state machine)
+
+  /payments/orders/{orderId}/instructions:
+    get:
+      tags: [Payments]
+      summary: Get payment instructions (buyer)
+  /payments/orders/{orderId}/submit:
+    post:
+      tags: [Payments]
+      summary: Submit payment evidence (buyer) — always unverified
+  /payments/orders/{orderId}/mine:
+    get:
+      tags: [Payments]
+      summary: List my payment records for order
+
+  /notifications:
+    get:
+      tags: [Notifications]
+      summary: List own notifications
+  /notifications/{id}/read:
+    patch:
+      tags: [Notifications]
+      summary: Mark one as read
+  /notifications/read-all:
+    post:
+      tags: [Notifications]
+      summary: Mark all as read
+
+  /shipments/orders/{orderId}:
+    get:
+      tags: [Shipments]
+      summary: Get shipment for order
+  /shipments/orders/{orderId}/events:
+    post:
+      tags: [Shipments]
+      summary: Add shipment event (importer or admin)
+
+  /messages:
+    get:
+      tags: [Messaging]
+      summary: List own conversations
+  /messages/{id}:
+    get:
+      tags: [Messaging]
+      summary: Get conversation
+  /messages/{id}/messages:
+    get:
+      tags: [Messaging]
+      summary: List messages
+    post:
+      tags: [Messaging]
+      summary: Send message
+
+  /disputes:
+    get:
+      tags: [Disputes]
+      summary: List disputes I opened
+  /disputes/orders/{orderId}:
+    get:
+      tags: [Disputes]
+      summary: List disputes for order
+    post:
+      tags: [Disputes]
+      summary: Open dispute (buyer or importer) — order becomes DISPUTED
+  /disputes/{id}/messages:
+    post:
+      tags: [Disputes]
+      summary: Add dispute message
+  /disputes/{id}/withdraw:
+    post:
+      tags: [Disputes]
+      summary: Withdraw dispute (opener only)
+
+  /reviews/importers/{importerId}:
+    get:
+      tags: [Reviews]
+      summary: Public list of importer reviews
+  /reviews/orders/{orderId}:
+    post:
+      tags: [Reviews]
+      summary: Submit review for completed order (buyer only)
+
+  /uploads/single:
+    post:
+      tags: [Uploads]
+      summary: Upload one file
+  /uploads/multiple:
+    post:
+      tags: [Uploads]
+      summary: Upload up to 10 files
+
+  /admin/reports/summary:
+    get:
+      tags: [Admin]
+      summary: Dashboard KPI summary
+      security: [{ BearerAuth: [] }]
+  /admin/importers:
+    get:
+      tags: [Admin]
+      summary: List importers
+  /admin/importers/{importerId}/review:
+    patch:
+      tags: [Admin]
+      summary: Approve / reject / suspend / reinstate / expire
+  /admin/orders:
+    get:
+      tags: [Admin]
+      summary: List all orders
+  /admin/orders/{id}/transition:
+    post:
+      tags: [Admin]
+      summary: Admin state transition (audited)
+  /admin/payments/{id}/review:
+    post:
+      tags: [Admin]
+      summary: Verify / reject / reverse / dispute payment
+  /admin/disputes:
+    get:
+      tags: [Admin]
+      summary: List disputes
+  /admin/disputes/{id}/resolve:
+    post:
+      tags: [Admin]
+      summary: Resolve dispute
+  /admin/commission-rules:
+    get:
+      tags: [Admin]
+      summary: List commission rules
+    post:
+      tags: [Admin]
+      summary: Create commission rule
+  /admin/commission-records:
+    get:
+      tags: [Admin]
+      summary: List commission records
+  /admin/revenue/summary:
+    get:
+      tags: [Admin]
+      summary: Revenue reconciliation summary
+  /admin/fraud-reports:
+    get:
+      tags: [Admin]
+      summary: List fraud reports
+  /admin/audit:
+    get:
+      tags: [Admin]
+      summary: List audit log entries
+  /admin/legal-checklist:
+    get:
+      tags: [Admin]
+      summary: Legal review tracking
+  /admin/legal-checklist/{item}:
+    patch:
+      tags: [Admin]
+      summary: Update legal review item
+
+  /fraud-reports:
+    post:
+      tags: [Admin]
+      summary: Submit fraud report (anyone)
+      security: []
+
+security:
+  - BearerAuth: []
