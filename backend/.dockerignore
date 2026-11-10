@@ -8,3 +8,6 @@ coverage
 logs
 .git
 .github
+uploads
+!src/modules/uploads/
+!src/modules/uploads/**
